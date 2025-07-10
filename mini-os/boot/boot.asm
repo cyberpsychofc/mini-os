@@ -1,7 +1,8 @@
-bits 16		; 16 bit real mode
-org 0x7c00	; BIOS loads OS at this address
+bits 16			; 16 bit real mode
+org 0x7c00		; BIOS loads OS at this address
 
 start:
+	cli
 	; Setting up segment registers
 	xor ax, ax	; Zero out AX
 	mov ds, ax	; Data Segment
@@ -20,9 +21,6 @@ start:
 	mov si, real_mode_msg
 	call print_string
 
-	; Disable interrupts
-	cli
-
 	; Enabling A20 line (simple method via keyboard controller)
 	in al, 0x92
 	or al, 2
@@ -34,42 +32,26 @@ start:
 	test edx, 1 << 29	; Check for long mode bit
 	jz no_long_mode
 
-	; Paging
-	mov edi, 0x1000		; Start of page tables
-	mov cr3, edi		; Set CR3 to PML4 base
-	xor eax, eax
-	mov ecx, 0x1000		; Clear 4 KB (PML4, PDP, PD, PT)
-	rep stosb
+	; Load kernel using INT 13h, 10 sectors from LBA 1
+	mov bx, 0x8000
+	mov es, bx
+	xor bx, bx	; Offset 0
+	mov ah, 0x02	; BIOS read sector function
+	mov al, 10	; 10 sectors
+	mov ch, 0
+	mov cl, 2
+	mov dh, 0
+	mov dl, 0x80
+	int 0x13
+	jc disk_error	; If fails to load kernel
 
-	; PML4: Map first entry to PDP
-	mov edi, 0x1000
-	mov dword [edi], 0x2003	; PDP base (0x2000) + present + writable
-
-	; PDP: Map first entry to PD
-	mov edi, 0x2000
-	mov dword [edi], 0x3003	; PD base (0x3000) + present + writable
-
-	; PD: Map first entry to PT
-	mov edi, 0x3000
-	mov dword [edi], 0x4003	;PT base (0x4000) + present + writable
-
-	; PT: Identify map first 2 MB (512 * 4 KB pages)
-	mov edi, 0x4000
-	mov ebx, 0x0003	; Page base + present + writable
-	mov ecx, 512	; 512 entries
-.pt_loop:
-	mov [edi], ebx
-	add ebx, 0x1000	; Next 4 KB page
-	add edi, 8
-	loop .pt_loop
+	; Load GDT
+	lgdt [gdt_descriptor]
 
 	; Enable PAE
 	mov eax, cr4
 	or eax, 1<<5	; Set PAE bit
 	mov cr4, eax
-
-	; Load GDT
-	lgdt [gdt_descriptor]
 
 	; Enable long mode (64 bit)
 	mov ecx, 0xC0000080	; EFER MSR
@@ -99,39 +81,27 @@ no_long_mode:
 	mov si, no_long_mode_msg
 	call print_string
 	jmp $
+disk_error:
+	mov si, disk_error_msg
+	call print_string
+	jmp $
 
-; GDT definition
+; GDT config
 
 gdt_start:
 	; Null Descriptor
-	dq 0x0000000000000000
-
-	; Code Segment Descriptor
-	; Base=0, Limit=0xFFFFFF, Access=0x9A (present, code, executable)
-
-	dw 0xFFFF	; Limit (0-15 bits)
-	dw 0x0000	; Base (0-15 bits)
-	db 0x00		; Base (16-23 bits)
-	db 0x9A		; Access byte (present, ring 0, data)
-	db 0xAF		; Granularity (4k pages) + Limit (16-19 bits)
-	db 0x00		; Base (24-31 bits)
-
-	; Data Segment Descriptor
-	; Base=0, Limit=0xFFFF, Access=0x92 (present, data, read/write)
-	dw 0xFFFF	; Same as Code Seg.
-	dw 0x0000
-	db 0x00
-	db 0x92
-	db 0xCF
-	db 0x00
+	dq 0
+	dq 0x00AF9A000000FFFF	; Code Segment
+	dq 0x00AF92000000FFFF	; Data Segment
 gdt_end:
 gdt_descriptor:
 	dw gdt_end - gdt_start - 1	; GDT size
-	dd gdt_start			; GDT addr
+	dq gdt_start			; GDT addr
 
 ; Messages
 real_mode_msg db "Booting in Real Mode...", 0
 no_long_mode_msg db "Long mode not supported!", 0
+disk_error_msg db "Disk read failed!", 0
 
 bits 64		; 64 bit Long Mode
 long_mode:
@@ -143,26 +113,43 @@ long_mode:
 	mov gs, ax
 	mov ss, ax
 
-	; Clear VGA Buffer
-	mov edi, 0xB8000
-	mov rax, 0x0720072007200720	; Space char + white on black
-	mov ecx, 500
-	rep stosq
+	; Setup identity-mapped page tables
+    mov rdi, 0x1000         ; PML4
+    xor rax, rax
+    mov rcx, 0x1000 / 8     ; Clear 4KB
 
-	; Print VGA Buffer
-	mov edi, 0xB8000	; VGA text buffer address
-	mov rsi, long_mode_msg
-	mov ah, 0x07		; White on black attr
-.print_loop:
-	lodsb			; Load next byte from ESI
-	cmp al, 0
-	je .done
-	mov [edi], ax		; Write character and attr to VGA
-	add edi, 2		; Move to VGA Position
-	jmp .print_loop
-.done:
-	hlt
+.zero_page_tables:
+    mov qword [rdi], rax
+    add rdi, 8
+    loop .zero_page_tables
+
+    ; Build paging structure
+    mov qword [0x1000], 0x2003      ; PML4 to PDP
+    mov qword [0x2000], 0x3003      ; PDP to PD
+    mov qword [0x3000], 0x4003      ; PD to PT
+
+    mov rdi, 0x4000                 ; PT entries
+    mov rbx, 0x0000000000000003
+    mov rcx, 512
+.map_pages:
+    mov qword [rdi], rbx
+    add rbx, 0x1000
+    add rdi, 8
+    loop .map_pages
+
+	; Copy kernel from 0x80000 to 0x100000
+    mov rsi, 0x80000
+    mov rdi, 0x100000
+    mov rcx, (5120 / 8)      ; 10 sectors = 640 qwords
+.copy_loop:
+    mov rax, [rsi]
+    mov [rdi], rax
+    add rsi, 8
+    add rdi, 8
+    loop .copy_loop
+
+	jmp 0x100000
 
 long_mode_msg db "Booting in 64 bit long Mode...", 0
-times 510-($-$$) db 0	; Pad to 510 bytes
-dw 0xAA55		; Boot signature
+times 510-($-$$) db 0			; Pad to 510 bytes
+dw 0xAA55				; Boot signature
