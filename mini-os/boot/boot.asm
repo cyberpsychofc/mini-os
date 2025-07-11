@@ -1,155 +1,164 @@
-bits 16			; 16 bit real mode
-org 0x7c00		; BIOS loads OS at this address
+bits 16
+org 0x7c00
 
 start:
-	cli
-	; Setting up segment registers
-	xor ax, ax	; Zero out AX
-	mov ds, ax	; Data Segment
-	mov es, ax	; Extra Segment
-	mov ss, ax 	; Stack segment
-	mov sp, 0x7c00	; Set Stack Pointer just below the bootloader
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7c00
 
-	; Clear screen in real mode
-	mov ax, 0x0600
-	mov bh, 0x07
-	xor cx, cx
-	mov dx, 0x184F
-	int 0x10
+    ; Clear screen
+    mov ax, 0x0600
+    mov bh, 0x07
+    xor cx, cx
+    mov dx, 0x184F
+    int 0x10
 
-	; Printing an output in real mode
-	mov si, real_mode_msg
-	call print_string
+    ; Enable A20
+    in al, 0x92
+    or al, 2
+    out 0x92, al
 
-	; Enabling A20 line (simple method via keyboard controller)
-	in al, 0x92
-	or al, 2
-	out 0x92, al
+    ; Check 64-bit support
+    mov eax, 0x80000001
+    cpuid
+    test edx, 1 << 29
+    jz no_long_mode
 
-	; Check for 64 bit support
-	mov eax, 0x80000001
-	cpuid
-	test edx, 1 << 29	; Check for long mode bit
-	jz no_long_mode
-
-	; Load kernel using INT 13h, 10 sectors from LBA 1
-	mov bx, 0x8000
-	mov es, bx
-	xor bx, bx	; Offset 0
-	mov ah, 0x02	; BIOS read sector function
-	mov al, 10	; 10 sectors
-	mov ch, 0
-	mov cl, 2
-	mov dh, 0
-	mov dl, 0x80
-	int 0x13
-	jc disk_error	; If fails to load kernel
-
-	; Load GDT
-	lgdt [gdt_descriptor]
-
-	; Enable PAE
-	mov eax, cr4
-	or eax, 1<<5	; Set PAE bit
-	mov cr4, eax
-
-	; Enable long mode (64 bit)
-	mov ecx, 0xC0000080	; EFER MSR
-	rdmsr
-	or eax, 1 << 8		; Set long mode bit
-	wrmsr
-
-	; Enable paging and protected mode
-	mov eax, cr0
-	or eax, 1 << 31		; Set paging bit
-	or eax, 1 << 0		; Set protected mode bit
-	mov cr0, eax
-
-	jmp 0x08:long_mode
-
-print_string:
-	mov ah, 0x0e	; BIOS teletype output function
-.loop:
-	lodsb		; Load next byte from [SI] into AL, increment SI
-	cmp al, 0	; Check if end of string
-	je .done
-	int 0x10	; Call BIOS to print character in AL
-	jmp .loop
-.done:
-	ret
-no_long_mode:
-	mov si, no_long_mode_msg
-	call print_string
-	jmp $
-disk_error:
-	mov si, disk_error_msg
-	call print_string
-	jmp $
-
-; GDT config
-
-gdt_start:
-	; Null Descriptor
-	dq 0
-	dq 0x00AF9A000000FFFF	; Code Segment
-	dq 0x00AF92000000FFFF	; Data Segment
-gdt_end:
-gdt_descriptor:
-	dw gdt_end - gdt_start - 1	; GDT size
-	dq gdt_start			; GDT addr
-
-; Messages
-real_mode_msg db "Booting in Real Mode...", 0
-no_long_mode_msg db "Long mode not supported!", 0
-disk_error_msg db "Disk read failed!", 0
-
-bits 64		; 64 bit Long Mode
-long_mode:
-	; Set up segment registers for protected mode
-	mov ax, 0x10	; Data segment selector
-	mov ds, ax
-	mov es, ax
-	mov fs, ax
-	mov gs, ax
-	mov ss, ax
-
-	; Setup identity-mapped page tables
-    mov rdi, 0x1000         ; PML4
-    xor rax, rax
-    mov rcx, 0x1000 / 8     ; Clear 4KB
-
-.zero_page_tables:
-    mov qword [rdi], rax
-    add rdi, 8
-    loop .zero_page_tables
-
-    ; Build paging structure
-    mov qword [0x1000], 0x2003      ; PML4 to PDP
-    mov qword [0x2000], 0x3003      ; PDP to PD
-    mov qword [0x3000], 0x4003      ; PD to PT
-
-    mov rdi, 0x4000                 ; PT entries
-    mov rbx, 0x0000000000000003
-    mov rcx, 512
+    ; Set up page tables
+    mov edi, 0x1000
+    xor eax, eax
+    mov ecx, 1024
+    rep stosd
+    mov dword [0x1000], 0x2003
+    mov dword [0x1004], 0
+    mov dword [0x2000], 0x3003
+    mov dword [0x2004], 0
+    mov dword [0x3000], 0x4003
+    mov dword [0x3004], 0
+    mov edi, 0x4000
+    mov eax, 0x00000003
+    mov ecx, 512
 .map_pages:
-    mov qword [rdi], rbx
-    add rbx, 0x1000
-    add rdi, 8
+    stosd
+    mov dword [edi], 0
+    add edi, 4
+    add eax, 0x1000
     loop .map_pages
 
-	; Copy kernel from 0x80000 to 0x100000
+    ; Set CR3
+    mov eax, 0x1000
+    mov cr3, eax
+
+    ; Load kernel (20 sectors from LBA 1)
+    mov ax, 0x8000
+    mov es, ax
+    xor bx, bx
+    mov ah, 0x02
+    mov al, 20
+    mov ch, 0
+    mov cl, 2
+    mov dh, 0
+    mov dl, 0x00
+    int 0x13
+    jc disk_error
+
+    ; Verify kernel (check first 4 words)
+    mov ax, 0x8000
+    mov es, ax
+    xor bx, bx
+    mov cx, 4
+.verify_loop:
+    mov ax, [es:bx]
+    test ax, ax
+    jnz .valid_data
+    add bx, 2
+    loop .verify_loop
+    jmp kernel_load_error
+.valid_data:
+    mov al, 'K'
+    call print_char
+
+    ; Load GDT
+    lgdt [gdt_descriptor]
+
+    ; Enable PAE
+    mov eax, cr4
+    or eax, 1 << 5
+    mov cr4, eax
+
+    ; Enable long mode
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, 1 << 8
+    wrmsr
+
+    ; Enable paging and protected mode
+    mov eax, cr0
+    or eax, 1 << 31
+    or eax, 1 << 0
+    mov cr0, eax
+
+    jmp 0x08:long_mode
+
+print_char:
+    mov ah, 0x0e
+    int 0x10
+    mov al, 0x0d  ; CR
+    int 0x10
+    mov al, 0x0a  ; LF
+    int 0x10
+    ret
+
+no_long_mode:
+    mov al, 'E'
+    call print_char
+    mov al, '1'
+    call print_char
+    jmp $
+
+disk_error:
+    mov al, 'E'
+    call print_char
+    mov al, '2'
+    call print_char
+    jmp $
+
+kernel_load_error:
+    mov al, 'E'
+    call print_char
+    mov al, '3'
+    call print_char
+    jmp $
+
+gdt_start:
+    dq 0
+    dq 0x00209A0000000000
+    dq 0x0000920000000000
+gdt_end:
+
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1
+    dd gdt_start
+
+bits 64
+long_mode:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; Copy kernel (10240 bytes = 1280 quadwords)
     mov rsi, 0x80000
     mov rdi, 0x100000
-    mov rcx, (5120 / 8)      ; 10 sectors = 640 qwords
-.copy_loop:
-    mov rax, [rsi]
-    mov [rdi], rax
-    add rsi, 8
-    add rdi, 8
-    loop .copy_loop
+    mov rcx, 1280
+    rep movsq
 
-	jmp 0x100000
+    jmp 0x100000
 
-long_mode_msg db "Booting in 64 bit long Mode...", 0
-times 510-($-$$) db 0			; Pad to 510 bytes
-dw 0xAA55				; Boot signature
+times 510-($-$$) db 0
+dw 0xAA55

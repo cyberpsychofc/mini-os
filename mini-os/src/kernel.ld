@@ -1,27 +1,41 @@
-OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(_start)
 
-SECTIONS {
-    /* Load the kernel at 0x100000 */
+SECTIONS
+{
     . = 0x100000;
-
-    /* Text (code) section */
-    .text : {
+    
+    _kernel_start = .;
+    
+    .text : ALIGN(4K)
+    {
+        *(.text.startup)
         *(.text)
     }
-
-    /* Read-only data */
-    .rodata : {
-        *(.rodata)
+    
+    .rodata : ALIGN(4K)
+    {
+        *(.rodata*)
     }
-
-    /* Data section */
-    .data : {
+    
+    .data : ALIGN(4K)
+    {
         *(.data)
     }
-
-    /* BSS section (zero-initialized data) */
-    .bss : {
-        *(.bss COMMON)
+    
+    .bss : ALIGN(4K)
+    {
+        _bss_start = .;
+        *(COMMON)
+        *(.bss)
+        _bss_end = .;
+    }
+    
+    _kernel_end = .;
+    
+    /DISCARD/ :
+    {
+        *(.note*)
+        *(.comment*)
+        *(.eh_frame*)
     }
 }
